@@ -11,7 +11,7 @@ const source = JSON.stringify({
   messages: [
     { role: "user", content: "repair the parser" },
     { role: "assistant", content: [{ type: "thinking", text: "inspect first" }, { type: "tool_use", id: "call-1", name: "Read", input: { file_path: "parser.go" } }], model: "claude-sonnet", usage: { input_tokens: 10, output_tokens: 20 } },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "package parser" }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "package parser", is_error: true }] },
     { role: "assistant", content: "Parser repaired and tests pass.", stop_reason: "end_turn" },
   ],
 });
@@ -43,6 +43,18 @@ test("claude code codec parses the native fixture", async () => {
   assert.equal(transcript.messages[3].content[0].text, "done");
   assert.ok(warnings.some((warning) => warning.code === "native_record_omitted" && warning.message.includes("file-history-snapshot")));
   assert.ok(warnings.some((warning) => warning.code === "native_record_omitted" && warning.message.includes("sidechain")));
+  // encrypted thinking parses to a timestamped message; stop_reason survives parse
+  assert.equal(transcript.messages[0].timestamp, "2026-01-01T00:00:00.000Z");
+  assert.equal(transcript.messages[1].stop_reason, "tool_use");
+  assert.equal(transcript.messages[3].stop_reason, "end_turn");
+  // rendering the native fixture emits a redacted_thinking block and never the "encrypted" key
+  const rendered = codec.render(transcript);
+  assert.ok(rendered.includes("redacted_thinking"));
+  assert.ok(!rendered.includes('"encrypted"'));
+  const reparsed = codec.parse(rendered).transcript;
+  assert.equal(reparsed.messages[1].content[0].type, "thinking");
+  assert.equal(reparsed.messages[1].content[0].encrypted, "synthetic-ciphertext");
+  assert.equal(reparsed.messages[1].stop_reason, "tool_use");
   const plain = toText(transcript, { maxBytes: 1 << 20 });
   assert.ok(plain.includes("native fixture"));
   assert.ok(!plain.includes("SIDECHAIN MUST NOT LEAK"));
@@ -61,6 +73,7 @@ test("claude code codec round-trips canonical transcripts", () => {
   assert.equal(reparsed.messages[1].model, "claude-sonnet");
   assert.deepEqual(reparsed.messages[1].usage, { input_tokens: 10, output_tokens: 20 });
   assert.equal(reparsed.messages[2].content[0].tool_use_id, "call-1");
+  assert.equal(reparsed.messages[2].content[0].is_error, true);
   assert.equal(reparsed.messages[3].content[0].text, "Parser repaired and tests pass.");
   const second = codec.parse(codec.render(reparsed)).transcript;
   assert.equal(second.messages.length, 4);
@@ -93,7 +106,7 @@ test("claude code codec omits invalid records and bookkeeping with warnings", ()
   assert.ok(warnings.some((warning) => warning.code === "native_fields_omitted"));
   assert.ok(warnings.some((warning) => warning.code === "native_record_omitted" && warning.message.includes("queue")));
   assert.ok(warnings.some((warning) => warning.code === "invalid_json"));
-  // plain thinking without a signature renders as visible text
+  // hello/hi transcript round-trips through render+parse unchanged (omissions do not affect content)
   const rendered = codec.render(transcript);
   const reparsed = codec.parse(rendered).transcript;
   assert.equal(reparsed.messages[0].content[0].text, "hello");
