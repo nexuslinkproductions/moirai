@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { ClaudeCodeCodec, MoiraiError, SimpleCodec, toText } from "../dist/index.js";
+import { ClaudeCodeCodec, MoiraiError, Registry, SimpleCodec, toText } from "../dist/index.js";
 
 const fixturePath = "../../testdata/native/claude_code.jsonl";
 
@@ -44,11 +44,11 @@ test("claude code codec parses the native fixture", async () => {
   assert.ok(warnings.some((warning) => warning.code === "native_record_omitted" && warning.message.includes("file-history-snapshot")));
   assert.ok(warnings.some((warning) => warning.code === "native_record_omitted" && warning.message.includes("sidechain")));
   // encrypted thinking parses to a timestamped message; stop_reason survives parse
-  assert.equal(transcript.messages[0].timestamp, "2026-01-01T00:00:00.000Z");
+  assert.equal(transcript.messages[0].timestamp, "2026-01-01T00:00:00Z");
   assert.equal(transcript.messages[1].stop_reason, "tool_use");
   assert.equal(transcript.messages[3].stop_reason, "end_turn");
   // rendering the native fixture emits a redacted_thinking block and never the "encrypted" key
-  const rendered = codec.render(transcript);
+  const rendered = codec.render(transcript).data;
   assert.ok(rendered.includes("redacted_thinking"));
   assert.ok(!rendered.includes('"encrypted"'));
   const reparsed = codec.parse(rendered).transcript;
@@ -62,7 +62,7 @@ test("claude code codec parses the native fixture", async () => {
 
 test("claude code codec round-trips canonical transcripts", () => {
   const codec = new ClaudeCodeCodec();
-  const rendered = codec.render(fixture());
+  const rendered = codec.render(fixture()).data;
   const reparsed = codec.parse(rendered).transcript;
   assert.equal(reparsed.messages.length, 4);
   assert.equal(reparsed.messages[0].content[0].text, "repair the parser");
@@ -75,7 +75,7 @@ test("claude code codec round-trips canonical transcripts", () => {
   assert.equal(reparsed.messages[2].content[0].tool_use_id, "call-1");
   assert.equal(reparsed.messages[2].content[0].is_error, true);
   assert.equal(reparsed.messages[3].content[0].text, "Parser repaired and tests pass.");
-  const second = codec.parse(codec.render(reparsed)).transcript;
+  const second = codec.parse(codec.render(reparsed).data).transcript;
   assert.equal(second.messages.length, 4);
   assert.equal(second.messages[3].content[0].text, "Parser repaired and tests pass.");
   // rendered output is line-delimited JSON records with Claude Code envelope fields
@@ -107,7 +107,7 @@ test("claude code codec omits invalid records and bookkeeping with warnings", ()
   assert.ok(warnings.some((warning) => warning.code === "native_record_omitted" && warning.message.includes("queue")));
   assert.ok(warnings.some((warning) => warning.code === "invalid_json"));
   // hello/hi transcript round-trips through render+parse unchanged (omissions do not affect content)
-  const rendered = codec.render(transcript);
+  const rendered = codec.render(transcript).data;
   const reparsed = codec.parse(rendered).transcript;
   assert.equal(reparsed.messages[0].content[0].text, "hello");
 });
@@ -118,4 +118,71 @@ test("claude code codec rejects transcripts without conversational records and e
   assert.throws(() => codec.parse(empty), (error) => error instanceof MoiraiError && error.code === "invalid_transcript");
   const deep = `${JSON.stringify({ type: "user", sessionId: "s", message: { role: "user", content: "ok" } })}\n{"type":"user","message":{"role":"user","content":[[[[[[[[[[[[[[[["deep"]]]]]]]]]]]]]]]]}}\n`;
   assert.throws(() => codec.parse(deep, { limits: { maxInputBytes: 1 << 20, maxMessages: 100, maxBlocks: 100, maxTextBytes: 1 << 20, maxInlineMediaBytes: 1 << 20, maxMetadataBytes: 1 << 20, maxNestingDepth: 8 } }), (error) => error instanceof MoiraiError && error.code === "limit_exceeded");
+});
+
+test("convert reports artifact, unknown, and extension loss when rendering claude code", () => {
+  const registry = new Registry([new SimpleCodec(), new ClaudeCodeCodec()]);
+  const simple = JSON.stringify({
+    id: "lossy",
+    timestamp: "2026-01-01T00:00:00Z",
+    extra: { vendor: "keep me" },
+    messages: [
+      { role: "user", content: [{ type: "text", text: "keep this" }], extra: { note: "mine" } },
+      { role: "user", content: [{ type: "artifact", artifact: { name: "report.md", source: { type: "text", text: "body" } } }] },
+      { role: "user", content: [{ type: "unknown", data: { anything: true } }] },
+    ],
+  });
+  const { data, warnings } = registry.convert(simple, "simple", "claude_code");
+  // representable content survives; artifact and unknown blocks are dropped from data
+  assert.ok(data.includes("keep this"));
+  assert.ok(!data.includes("report.md"));
+  assert.ok(!data.includes("anything"));
+  const artifactWarning = warnings.find((warning) => warning.code === "unsupported_block" && warning.path === "messages[1].content[0]");
+  assert.ok(artifactWarning, `missing artifact warning in ${JSON.stringify(warnings)}`);
+  assert.equal(artifactWarning.message, "claude_code cannot represent artifact content; block omitted");
+  const unknownWarning = warnings.find((warning) => warning.code === "unsupported_block" && warning.path === "messages[2].content[0]");
+  assert.ok(unknownWarning, `missing unknown warning in ${JSON.stringify(warnings)}`);
+  assert.equal(unknownWarning.message, "claude_code cannot represent unknown content; block omitted");
+  assert.ok(warnings.some((warning) => warning.code === "extension_omitted" && warning.message === "claude_code cannot represent canonical extension data; extension omitted"));
+  assert.ok(warnings.some((warning) => warning.code === "extension_omitted" && warning.path === "messages[0].extra" && warning.message === "claude_code cannot represent message extension data; extension omitted"));
+
+  // artifact-ONLY message: the block is dropped and the loss is still reported
+  const artifactOnly = JSON.stringify({
+    id: "artifact-only",
+    timestamp: "2026-01-01T00:00:00Z",
+    messages: [{ role: "user", content: [{ type: "artifact", artifact: { name: "only.md" } }] }],
+  });
+  const onlyResult = registry.convert(artifactOnly, "simple", "claude_code");
+  assert.ok(!onlyResult.data.includes("only.md"));
+  const onlyWarning = onlyResult.warnings.find((warning) => warning.code === "unsupported_block" && warning.path === "messages[0].content[0]");
+  assert.ok(onlyWarning, `missing artifact-only warning in ${JSON.stringify(onlyResult.warnings)}`);
+  assert.equal(onlyWarning.message, "claude_code cannot represent artifact content; block omitted");
+
+  // role mismatches are reported too: thinking/tool_use on user, tool_result on assistant
+  const misplaced = new SimpleCodec().parse(JSON.stringify({
+    id: "misplaced", timestamp: "2026-01-01T00:00:00Z",
+    messages: [
+      { role: "user", content: [{ type: "thinking", text: "why" }, { type: "tool_use", id: "t1", name: "Read", input: {} }] },
+      { role: "assistant", content: [{ type: "tool_result", tool_use_id: "t1", content: "x" }] },
+    ],
+  })).transcript;
+  const misplacedWarnings = new ClaudeCodeCodec().render(misplaced).warnings;
+  assert.deepEqual(misplacedWarnings.map((warning) => warning.path), ["messages[0].content[0]", "messages[0].content[1]", "messages[1].content[0]"]);
+});
+
+test("claude code timestamps preserve RFC3339 nanosecond precision", () => {
+  const codec = new ClaudeCodeCodec();
+  const nano = "2026-01-01T00:00:00.123456789Z";
+  const line = JSON.stringify({ type: "user", sessionId: "s", uuid: "u1", timestamp: nano, message: { role: "user", content: "hello" } });
+  const { transcript } = codec.parse(line);
+  assert.equal(transcript.messages[0].timestamp, nano);
+  assert.equal(transcript.meta.timestamp, nano);
+  // render + re-parse preserves the full nanosecond fraction
+  const roundTrip = codec.parse(codec.render(transcript).data).transcript;
+  assert.equal(roundTrip.messages[0].timestamp, nano);
+  assert.equal(roundTrip.meta.timestamp, nano);
+  // a millisecond timestamp that Date could represent exactly is still returned unchanged
+  const milli = "2026-01-01T00:00:00.123Z";
+  const milliParsed = codec.parse(JSON.stringify({ type: "user", sessionId: "s", uuid: "u2", timestamp: milli, message: { role: "user", content: "hi" } }));
+  assert.equal(milliParsed.transcript.messages[0].timestamp, milli);
 });

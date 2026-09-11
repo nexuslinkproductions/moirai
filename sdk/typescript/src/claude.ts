@@ -1,6 +1,6 @@
 import {
   DEFAULT_LIMITS, type Block, type Limits, type MediaSource, type Message, MoiraiError, newId,
-  type ParseResult, SCHEMA_VERSION, type Transcript, type Usage, validate, type Warning,
+  type ParseResult, type RenderResult, SCHEMA_VERSION, type Transcript, type Usage, validate, type Warning,
 } from "./model.js";
 import type { Codec, ParseOptions } from "./simple.js";
 
@@ -87,7 +87,7 @@ export class ClaudeCodeCodec implements Codec {
     return { transcript, warnings };
   }
 
-  render(transcript: Transcript, limits: Limits = { ...DEFAULT_LIMITS }): string {
+  render(transcript: Transcript, limits: Limits = { ...DEFAULT_LIMITS }): RenderResult {
     validate(transcript, limits);
     const sessionID = transcript.meta.id;
     const lines: string[] = [];
@@ -120,8 +120,57 @@ export class ClaudeCodeCodec implements Codec {
       last = id;
     });
     if (transcript.meta.title) lines.push(JSON.stringify({ type: "summary", summary: transcript.meta.title, leafUuid: last }));
-    return `${lines.join("\n")}\n`;
+    return { data: `${lines.join("\n")}\n`, warnings: renderLossWarnings(transcript, "claude_code") };
   }
+}
+
+// Mirrors Go renderLossWarnings (codec_helpers.go) for the claude_code format.
+function renderLossWarnings(transcript: Transcript, format: string): Warning[] {
+  const warnings: Warning[] = [];
+  if (hasExtra(transcript.extra) || hasExtra(transcript.meta.extra)) {
+    warnings.push({ code: "extension_omitted", message: `${format} cannot represent canonical extension data; extension omitted` });
+  }
+  transcript.messages.forEach((message, messageIndex) => {
+    if (hasExtra(message.extra)) {
+      warnings.push({ path: `messages[${messageIndex}].extra`, code: "extension_omitted", message: `${format} cannot represent message extension data; extension omitted` });
+    }
+    message.content.forEach((block, blockIndex) => {
+      if (renderSupportsBlock(message.role, block)) return;
+      warnings.push({
+        path: `messages[${messageIndex}].content[${blockIndex}]`,
+        code: "unsupported_block",
+        message: `${format} cannot represent ${block.type} content; block omitted`,
+      });
+    });
+  });
+  return warnings;
+}
+
+// Mirrors Go renderSupportsBlock for the claude_code format: artifact and
+// unknown blocks are never representable; image always is; thinking is
+// assistant-only; tool_use is assistant-only; tool_result is user-only.
+function renderSupportsBlock(role: Message["role"], block: Block): boolean {
+  switch (block.type) {
+    case "artifact": case "unknown":
+      return false;
+    case "image":
+      return Boolean(block.source);
+    case "thinking":
+      return role === "assistant";
+    case "tool_use":
+      return role === "assistant";
+    case "tool_result":
+      return role === "user";
+    case "text":
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Matches Go: Extra is json.RawMessage — present-but-empty ({}, null) still warns.
+function hasExtra(value: unknown): boolean {
+  return value !== undefined;
 }
 
 function parseAnthropicContent(value: unknown, messageIndex: number, pending: string[], warnings: Warning[]): Block[] {
@@ -258,8 +307,9 @@ function timestampValue(value: unknown): string {
   if (typeof value === "number" && Number.isFinite(value)) return unixTimestamp(value);
   if (typeof value !== "string" || !value) return "";
   if (RFC3339.test(value)) {
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) return parsed.toISOString();
+    // Valid RFC3339 is returned unchanged: re-formatting through Date would
+    // truncate sub-millisecond fractions (2026-01-01T00:00:00.123456789Z).
+    if (!Number.isNaN(new Date(value).getTime())) return value;
   }
   if (/^[+-]?\d+$/u.test(value.trim())) return unixTimestamp(Number(value));
   return "";
